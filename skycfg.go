@@ -21,6 +21,7 @@ package skycfg
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -40,6 +41,12 @@ import (
 	"github.com/stripe/skycfg/go/protomodule"
 	"github.com/stripe/skycfg/go/urlmodule"
 	"github.com/stripe/skycfg/go/yamlmodule"
+)
+
+// Starlark thread-local storage keys.
+const (
+	contextKey   = "context"   // has type context.Context
+	logOutputKey = "logoutput" // has type io.Writer
 )
 
 // A FileReader controls how load() calls resolve and read other modules.
@@ -112,12 +119,46 @@ type Config struct {
 	tests    []*Test
 }
 
+type commonOptions struct {
+	logOutput io.Writer
+}
+
+// A CommonOption is an option that can be applied to Load, Config.Main, and Test.Run.
+type CommonOption interface {
+	LoadOption
+	ExecOption
+	TestOption
+}
+
+type fnCommonOption func(options *commonOptions)
+
+func (fn fnCommonOption) applyLoad(opts *loadOptions) {
+	fn(&opts.commonOptions)
+}
+
+func (fn fnCommonOption) applyExec(opts *execOptions) {
+	fn(&opts.commonOptions)
+}
+
+func (fn fnCommonOption) applyTest(opts *testOptions) {
+	fn(&opts.commonOptions)
+}
+
+// WithLogOutput changes the destination of print() function calls in Starlark code.
+// If nil, os.Stderr will be used.
+func WithLogOutput(w io.Writer) CommonOption {
+	return fnCommonOption(func(opts *commonOptions) {
+		opts.logOutput = w
+	})
+}
+
 // A LoadOption adjusts details of how Skycfg configs are loaded.
 type LoadOption interface {
 	applyLoad(*loadOptions)
 }
 
 type loadOptions struct {
+	commonOptions
 	globals       starlark.StringDict
 	fileReader    FileReader
 	protoRegistry unstableProtoRegistryV2
@@ -185,13 +226,13 @@ func WithProtoRegistry(r unstableProtoRegistryV2) LoadOption {
 // registry).
 //
 // Currently provides these modules (see REAMDE for more detailed description):
-//  * fail   - interrupts execution and prints a stacktrace.
-//  * hash   - supports md5, sha1 and sha245 functions.
-//  * json   - marshals plain values (dicts, lists, etc) to JSON.
-//  * proto  - package for constructing Protobuf messages.
-//  * struct - experimental Starlark struct support.
-//  * yaml   - same as "json" package but for YAML.
-//  * url    - utility package for encoding URL query string.
+//   - fail   - interrupts execution and prints a stacktrace.
+//   - hash   - supports md5, sha1 and sha245 functions.
+//   - json   - marshals plain values (dicts, lists, etc) to JSON.
+//   - proto  - package for constructing Protobuf messages.
+//   - struct - experimental Starlark struct support.
+//   - yaml   - same as "json" package but for YAML.
+//   - url    - utility package for encoding URL query string.
 func UnstablePredeclaredModules(r unstableProtoRegistryV2) starlark.StringDict {
 	return starlark.StringDict{
 		"fail":   assertmodule.Fail,
@@ -287,8 +328,7 @@ func loadImpl(ctx context.Context, opts *loadOptions, filename string) (starlark
 	cache := make(map[string]*cacheEntry)
 	tests := []*Test{}
 
-	var load func(thread *starlark.Thread, moduleName string) (starlark.StringDict, error)
-	load = func(thread *starlark.Thread, moduleName string) (starlark.StringDict, error) {
+	load := func(thread *starlark.Thread, moduleName string) (starlark.StringDict, error) {
 		var fromPath string
 		if thread.CallStackDepth() > 0 {
 			fromPath = thread.CallFrame(0).Pos.Filename()
@@ -327,10 +367,12 @@ func loadImpl(ctx context.Context, opts *loadOptions, filename string) (starlark
 		}
 		return globals, err
 	}
-	locals, err := load(&starlark.Thread{
+	thread := &starlark.Thread{
 		Print: skyPrint,
 		Load:  load,
-	}, filename)
+	}
+	thread.SetLocal(logOutputKey, opts.logOutput)
+	locals, err := load(thread, filename)
 	return locals, tests, err
 }
 
@@ -358,6 +400,7 @@ type ExecOption interface {
 }
 
 type execOptions struct {
+	commonOptions
 	vars         *starlark.Dict
 	funcName     string
 	flattenLists bool
@@ -412,7 +455,8 @@ func (c *Config) Main(ctx context.Context, opts ...ExecOption) ([]proto.Message,
 	thread := &starlark.Thread{
 		Print: skyPrint,
 	}
-	thread.SetLocal("context", ctx)
+	thread.SetLocal(contextKey, ctx)
+	thread.SetLocal(logOutputKey, parsedOpts.logOutput)
 	mainCtx := &starlarkstruct.Module{
 		Name: "skycfg_ctx",
 		Members: starlark.StringDict(map[string]starlark.Value{
@@ -434,17 +478,13 @@ func (c *Config) Main(ctx context.Context, opts ...ExecOption) ([]proto.Message,
 	var msgs []proto.Message
 	for ii := 0; ii < mainList.Len(); ii++ {
 		maybeMsg := mainList.Index(ii)
-		// Only flatten but not flatten deep. This will flatten out, in order, lists within main list and append the
-		// message into msgs
+		// Flatten lists recursively. [[1, 2], 3] => [1, 2, 3]
 		if maybeMsgList, ok := maybeMsg.(*starlark.List); parsedOpts.flattenLists && ok {
-			for iii := 0; iii < maybeMsgList.Len(); iii++ {
-				maybeNestedMsg := maybeMsgList.Index(iii)
-				msg, ok := AsProtoMessage(maybeNestedMsg)
-				if !ok {
-					return nil, fmt.Errorf("%q returned something that's not a protobuf (a %s) within a nested list", parsedOpts.funcName, maybeNestedMsg.Type())
-				}
-				msgs = append(msgs, msg)
+			flattened, err := FlattenProtoList(maybeMsgList)
+			if err != nil {
+				return nil, fmt.Errorf("%q returned something that's not a protobuf within a nested list %w", parsedOpts.funcName, err)
 			}
+			msgs = append(msgs, flattened...)
 		} else {
 			msg, ok := AsProtoMessage(maybeMsg)
 			if !ok {
@@ -454,6 +494,27 @@ func (c *Config) Main(ctx context.Context, opts ...ExecOption) ([]proto.Message,
 		}
 	}
 	return msgs, nil
+}
+
+func FlattenProtoList(list *starlark.List) ([]proto.Message, error) {
+	var flattened []proto.Message
+	for i := 0; i < list.Len(); i++ {
+		v := list.Index(i)
+		if l, ok := v.(*starlark.List); ok {
+			recursiveFlattened, err := FlattenProtoList(l)
+			if err != nil {
+				return flattened, err
+			}
+			flattened = append(flattened, recursiveFlattened...)
+			continue
+		}
+		if msg, ok := AsProtoMessage(v); ok {
+			flattened = append(flattened, msg)
+		} else {
+			return flattened, fmt.Errorf("list contains object which is not a protobuf (got %s)", v.Type())
+		}
+	}
+	return flattened, nil
 }
 
 // A TestResult is the result of a test run
@@ -480,6 +541,7 @@ type TestOption interface {
 }
 
 type testOptions struct {
+	commonOptions
 	vars *starlark.Dict
 }
 
@@ -509,7 +571,8 @@ func (t *Test) Run(ctx context.Context, opts ...TestOption) (*TestResult, error)
 	thread := &starlark.Thread{
 		Print: skyPrint,
 	}
-	thread.SetLocal("context", ctx)
+	thread.SetLocal(contextKey, ctx)
+	thread.SetLocal(logOutputKey, parsedOpts.logOutput)
 
 	assertModule := assertmodule.AssertModule()
 	testCtx := &starlarkstruct.Module{
@@ -551,5 +614,95 @@ func (c *Config) Tests() []*Test {
 }
 
 func skyPrint(t *starlark.Thread, msg string) {
-	fmt.Fprintf(os.Stderr, "[%v] %s\n", t.CallFrame(1).Pos, msg)
+	var out io.Writer = os.Stderr
+	if w := t.Local(logOutputKey); w != nil {
+		out = w.(io.Writer)
+	}
+	fmt.Fprintf(out, "[%v] %s\n", t.CallFrame(1).Pos, msg)
+}
+
+// MainNonProtobuf executes main() or a custom entry point function from the top-level Skycfg config
+// module, which is expected to return either None or a list of strings, and NOT protobuf. If the rendered
+// entry point returns nested lists, then they are flattened. This is expected to be used
+// for Skycfg files which do not return protobufs (e.g. stringified YAML) which is then passed downstream
+// to other systems which process the string output.
+func (c *Config) MainNonProtobuf(ctx context.Context, opts ...ExecOption) ([]string, error) {
+	parsedOpts := &execOptions{
+		vars:     &starlark.Dict{},
+		funcName: "main",
+	}
+	for _, opt := range opts {
+		opt.applyExec(parsedOpts)
+	}
+	mainVal, ok := c.locals[parsedOpts.funcName]
+	if !ok {
+		return nil, fmt.Errorf("no %q function found in %q", parsedOpts.funcName, c.filename)
+	}
+	main, ok := mainVal.(starlark.Callable)
+	if !ok {
+		return nil, fmt.Errorf("%q must be a function (got a %s)", parsedOpts.funcName, mainVal.Type())
+	}
+
+	thread := &starlark.Thread{
+		Print: skyPrint,
+	}
+	thread.SetLocal(contextKey, ctx)
+	thread.SetLocal(logOutputKey, parsedOpts.logOutput)
+	mainCtx := &starlarkstruct.Module{
+		Name: "skycfg_ctx",
+		Members: starlark.StringDict(map[string]starlark.Value{
+			"vars": parsedOpts.vars,
+		}),
+	}
+	args := starlark.Tuple([]starlark.Value{mainCtx})
+	mainVal, err := starlark.Call(thread, main, args, nil)
+	if err != nil {
+		return nil, err
+	}
+	mainList, ok := mainVal.(*starlark.List)
+	if !ok {
+		if _, isNone := mainVal.(starlark.NoneType); isNone {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%q didn't return a list (got a %s)", parsedOpts.funcName, mainVal.Type())
+	}
+	var msgs []string
+	for ii := 0; ii < mainList.Len(); ii++ {
+		so := mainList.Index(ii)
+		if ss, ok := so.(starlark.String); ok {
+			msgs = append(msgs, ss.GoString())
+		} else {
+			// Flatten lists recursively. [[1, 2], 3] => [1, 2, 3]
+			if maybeMsgList, ok := so.(*starlark.List); parsedOpts.flattenLists && ok {
+				flattened, err := FlattenStringList(maybeMsgList)
+				if err != nil {
+					return msgs, fmt.Errorf("%q returned something that's not of type string or list within a nested list %w", parsedOpts.funcName, err)
+				}
+				msgs = append(msgs, flattened...)
+			} else {
+				return msgs, fmt.Errorf("%q returned an object inside list not of type String (got %s)", parsedOpts.funcName, so.Type())
+			}
+		}
+	}
+	return msgs, nil
+}
+
+func FlattenStringList(list *starlark.List) ([]string, error) {
+	var flattened []string
+	for i := 0; i < list.Len(); i++ {
+		v := list.Index(i)
+		if l, ok := v.(*starlark.List); ok {
+			recursiveFlattened, err := FlattenStringList(l)
+			if err != nil {
+				return flattened, err
+			}
+			flattened = append(flattened, recursiveFlattened...)
+			continue
+		} else if msg, ok := v.(starlark.String); ok {
+			flattened = append(flattened, msg.GoString())
+		} else {
+			return flattened, fmt.Errorf("list contains object not of type string (got %s)", v.Type())
+		}
+	}
+	return flattened, nil
 }
